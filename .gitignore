@@ -1,0 +1,41 @@
+# =========================
+# Python generated files
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+
+# =========================
+# Test / tooling caches
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# =========================
+# Environment variables & secrets
+# =========================
+.env
+secrets/
+
+# =========================
+# Editor / OS files
+# =========================
+.vscode/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Outputs / generated artifacts
+# =========================
+outputs/
+runs/
+*.log
