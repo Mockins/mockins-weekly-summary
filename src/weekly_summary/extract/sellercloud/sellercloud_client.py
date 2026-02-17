@@ -188,8 +188,8 @@ class SellercloudClient:
             "UtcOffset": -300,  # EST offset in minutes
         }
         
-        # Use the manage endpoint base instead of rest
-        url = f"{self.base_url.replace('/rest', '')}/api/Manage/ManageEntity/GetGridData"
+        # Correct URL - keep /rest in the path
+        url = f"{self.base_url}/api/Manage/ManageEntity/GetGridData"
         
         resp = self._session.post(
             url,
