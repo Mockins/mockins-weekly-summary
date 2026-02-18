@@ -8,9 +8,8 @@ from weekly_summary.extract.sellercloud.sellercloud_client import SellercloudCli
 
 def _normalize_sku(raw: Any) -> str:
     s = str(raw).strip()
-
-    if s.startswith("ZZZ-"):
-        s = s[4:]
+    
+    # Remove -LOC suffix but KEEP ZZZ prefix
     if s.endswith("-LOC"):
         s = s[:-4]
 
@@ -18,55 +17,12 @@ def _normalize_sku(raw: Any) -> str:
 
 
 def _is_good_sku(s: str) -> bool:
-    """
-    Real SKUs in your system look like:
-      NG-2Z-DRP-AM-48P-42
-      MA-RB-25BLK-69
-    Bad ones we want to ignore are digits-only ProductIDs like:
-      00819867020218
-    """
+    """Filter out numeric-only SKUs"""
     if not s:
         return False
     if s.isdigit():
         return False
-    # require at least one letter (filters out numeric junk)
     return any(ch.isalpha() for ch in s)
-
-
-def _extract_parent_sku(item: Dict[str, Any]) -> Optional[str]:
-    # 1) If it's a child, ShadowOf is the parent SKU we want
-    shadow = item.get("ShadowOf")
-    if shadow:
-        shadow_normalized = _normalize_sku(shadow)
-        # Don't use ShadowOf if it's the same as the product's own SKU
-        # (that's a self-reference, not a parent-child relationship)
-        sku = _normalize_sku(item.get("SKU") or item.get("ManufacturerSKU") or "")
-        if shadow_normalized != sku:
-            # It's a real parent-child relationship
-            return shadow_normalized if _is_good_sku(shadow_normalized) else None
-
-    # 2) Otherwise try a bunch of likely sku fields
-    candidates = [
-        item.get("SKU"),
-        item.get("Sku"),
-        item.get("ProductSKU"),
-        item.get("ProductSku"),
-        item.get("ManufacturerSKU"),
-        item.get("MerchantSKU"),
-        item.get("SellerSKU"),
-        item.get("DefaultSKU"),
-        item.get("DefaultSku"),
-    ]
-
-    for c in candidates:
-        if not c:
-            continue
-        sku = _normalize_sku(c)
-        if _is_good_sku(sku):
-            return sku
-
-    # 3) Last resort: skip if nothing matches
-    return None
 
 
 def pull_warehouse_inventory_qty(
@@ -74,83 +30,95 @@ def pull_warehouse_inventory_qty(
     *,
     company_id: int,
     warehouse_id: int,
-    page_size: int = 200,
-    exclude_zero_inventory: bool = True,
     qty_field: str = "InventoryAvailableQty",
-    warehouse_name: str = "190 Welles - Bins",
-    debug_first_item: bool = False,
+    exclude_zero_inventory: bool = True,
+    debug_pagination: bool = False,
 ) -> pd.DataFrame:
     """
     Pull warehouse inventory quantity from Sellercloud.
+    
+    Gets all items from inventory page, filtering for items with ANY non-zero quantity
+    (Physical, Reserved, or Available), then extracts SKU and available quantity.
+    This matches the "Inventory by Product Detail" report.
     
     Args:
         client: SellercloudClient instance
         company_id: Company ID (e.g., 177)
         warehouse_id: Warehouse ID (e.g., 142)
-        page_size: Results per page (default 200)
-        exclude_zero_inventory: Whether to exclude zero inventory items
         qty_field: Field name for quantity (default "InventoryAvailableQty")
-        warehouse_name: Specific warehouse name to filter by (e.g., "190 Welles - Bins")
-        debug_first_item: Print first item keys for debugging
+        exclude_zero_inventory: Filter out items with all zero quantities (default True)
+        debug_pagination: Print pagination info
     
     Returns:
         DataFrame with columns ["sku", "sc_warehouse_qty"]
     """
     rows: List[Dict[str, Any]] = []
     page = 1
-
+    
+    if debug_pagination:
+        print("Fetching all inventory pages...\n")
+    
     while True:
         data = client.get_inventory_page(
             company_id=company_id,
             warehouse_id=warehouse_id,
             page_number=page,
-            page_size=page_size,
-            exclude_zero_inventory=exclude_zero_inventory,
+            page_size=50,
+            exclude_zero_inventory=False,  # Get all, we'll filter client-side
         )
-
+        
         items = data.get("Items") or []
-
-        if debug_first_item and page == 1 and items:
-            print("Sellercloud first item keys:", sorted(items[0].keys()))
-            print("Sellercloud first item sample:", items[0])
-
+        
+        if debug_pagination:
+            print(f"  Page {page}: Got {len(items)} items")
+        
         if not items:
             break
-
-        for it in items:
-            # Filter to ONLY the specific warehouse (not aggregate/None)
-            wh_name = it.get("WarehouseName")
-            if wh_name != warehouse_name:
-                continue
-
-            sku = _extract_parent_sku(it)
+        
+        for item in items:
+            # Check if ANY quantity field is non-zero (matches report behavior)
+            physical_qty = float(item.get("PhysicalQty", 0) or 0)
+            reserved_qty = float(item.get("ReservedQty", 0) or 0)
+            available_qty = float(item.get(qty_field, 0) or 0)
+            
+            # Filter: only include if ANY quantity is non-zero
+            if exclude_zero_inventory:
+                if physical_qty == 0 and reserved_qty == 0 and available_qty == 0:
+                    continue
+            
+            # Extract SKU - use ManufacturerSKU (has -LOC duplicates that we'll normalize)
+            sku = item.get("ManufacturerSKU") or item.get("SKU")
+            
             if not sku:
                 continue
-
-            qty_raw = it.get(qty_field)
-            try:
-                qty = float(qty_raw) if qty_raw is not None else 0.0
-            except Exception:
-                qty = 0.0
-
-            rows.append({"sku": sku, "sc_warehouse_qty": qty})
-
-        # paging stop: if we got less than a full page, we're done
-        if len(items) < page_size:
+            
+            sku = _normalize_sku(sku)
+            
+            # Filter out numeric-only SKUs
+            if not _is_good_sku(sku):
+                continue
+            
+            rows.append({"sku": sku, "sc_warehouse_qty": available_qty})
+        
+        if len(items) < 50:
             break
-
+        
         page += 1
-
+    
+    if debug_pagination:
+        print(f"  Total pages processed: {page-1}\n")
+    
     if not rows:
         return pd.DataFrame(columns=["sku", "sc_warehouse_qty"])
-
+    
     df = pd.DataFrame(rows)
-
-    # Group to parent level and take the max (to avoid double-counting parent + bin)
+    
+    # Dedup (group by sku, take max qty)
     df = (
         df.groupby("sku", as_index=False)["sc_warehouse_qty"]
         .max()
         .sort_values("sc_warehouse_qty", ascending=False)
         .reset_index(drop=True)
     )
+    
     return df
