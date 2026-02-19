@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 
 from weekly_summary.extract.sellercloud.sellercloud_client import SellercloudClient, SellercloudConfig
-from weekly_summary.extract.sellercloud.sc_run import pull_warehouse_inventory_qty
+from weekly_summary.sc_run import pull_warehouse_inventory_qty
 
 from weekly_summary.extract.amazon.pull_restock_inventory import pull_restock_inventory_raw
 from weekly_summary.transform.restock_inventory import load_and_normalize_restock
