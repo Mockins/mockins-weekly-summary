@@ -39,3 +39,8 @@ Thumbs.db
 outputs/
 runs/
 *.log
+
+__init__.py
+sellercloud_client_cookies.py
+sellercloud_delta_client.py
+sellercloud_extract_cookies.py

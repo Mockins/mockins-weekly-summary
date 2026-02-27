@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+
 @dataclass(frozen=True)
 class SpApiConfig:
     refresh_token: str
@@ -11,13 +12,20 @@ class SpApiConfig:
     region: str
     marketplace_id: str
 
+
 def _require(name: str) -> str:
     value = os.getenv(name)
-    if not value: 
+
+    # TEMP DEBUG: confirm which refresh token is being loaded at runtime
+    if name == "SPAPI_REFRESH_TOKEN" and value:
+        print("DEBUG SPAPI_REFRESH_TOKEN prefix:", value[:12])
+
+    if not value:
         raise RuntimeError(f"Missing required env var: {name}")
     return value
 
-def load_spapi_config() -> SpApiConfig: 
+
+def load_spapi_config() -> SpApiConfig:
     """
     Load Amazon SP-API configuration from environment variables.
     """
@@ -28,5 +36,3 @@ def load_spapi_config() -> SpApiConfig:
         region=os.getenv("SPAPI_REGION", "us-east-1"),
         marketplace_id=_require("SPAPI_MARKETPLACE_ID"),
     )
-    
-

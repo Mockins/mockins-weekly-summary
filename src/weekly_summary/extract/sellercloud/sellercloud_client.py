@@ -1,103 +1,200 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
+"""
+SellerCloud API client with token-based authentication and retry logic.
+"""
+import os
+import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class SellercloudConfig:
-    rest_api_base_url: str  # e.g. https://sd.api.sellercloud.com/rest
-    username: str
-    password: str
-    timeout_s: int = 60
-
-
-class SellercloudClient:
-    def __init__(self, config: SellercloudConfig) -> None:
-        self.config = config
-        self.base_url = config.rest_api_base_url.rstrip("/")
-        self._token: Optional[str] = None
-
-        self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
-
-    def get_token(self) -> str:
-        if self._token:
-            return self._token
-
-        url = f"{self.base_url}/api/token"
-        resp = self._session.post(
-            url,
-            data={"username": self.config.username, "password": self.config.password},
-            timeout=self.config.timeout_s,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        token = data.get("access_token") or data.get("AccessToken") or data.get("token")
-        if not token:
-            raise RuntimeError(f"Sellercloud token missing in response: {data}")
-
-        self._token = token
-        return token
-
-    def _auth_headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.get_token()}"}
-
-    def get_inventory_page(
+class SellerCloudClient:
+    """
+    Handles authentication and API requests to SellerCloud REST API.
+    Supports bearer token authentication and automatic retries for rate limits/5xx errors.
+    """
+    
+    def __init__(
         self,
-        *,
-        company_id: int,
-        warehouse_id: int,
-        page_number: int,
-        page_size: int,
-        exclude_zero_inventory: bool = True,
-    ) -> Dict[str, Any]:
+        server_id: str,
+        username: str,
+        password: str,
+        timeout: int = 30,
+        max_retries: int = 3,
+    ):
         """
-        Matches the Postman call you used:
-        GET /api/inventory?companyID=177&warehouses=142&pageNumber=1&pageSize=200&excludeZeroInventory=true
+        Initialize SellerCloud client.
+        
+        Args:
+            server_id: SellerCloud server ID (from environment)
+            username: API username (from environment)
+            password: API password (from environment)
+            timeout: Request timeout in seconds (default: 30)
+            max_retries: Maximum retry attempts for 429/5xx errors (default: 3)
         """
-        url = f"{self.base_url}/api/inventory"
-        params = {
-            "companyID": company_id,
-            "warehouses": warehouse_id,
-            "pageNumber": page_number,
-            "pageSize": page_size,
+        self.server_id = server_id
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.base_url = f"https://{server_id}.api.sellercloud.com/rest/api"
+        self.access_token: Optional[str] = None
+        
+        # Session with retry strategy for 429 (Too Many Requests) and 5xx errors
+        self.session = self._create_session()
+    
+    def _create_session(self) -> requests.Session:
+        """Create a requests session with retry strategy."""
+        session = requests.Session()
+        
+        # Retry strategy: retry on 429 and 5xx errors
+        retry_strategy = Retry(
+            total=self.max_retries,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            backoff_factor=1.0,  # Exponential backoff: 1s, 2s, 4s, etc.
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        return session
+    
+    def _fetch_token(self) -> str:
+        """
+        Fetch a new access token from SellerCloud.
+        
+        Returns:
+            Access token string
+            
+        Raises:
+            requests.RequestException: If token request fails
+            ValueError: If response doesn't contain access_token
+        """
+        token_url = f"{self.base_url}/token"
+        payload = {
+            "Username": self.username,
+            "Password": self.password,
         }
-        if exclude_zero_inventory:
-            params["excludeZeroInventory"] = "true"
-
-        resp = self._session.get(
-            url,
-            params=params,
-            headers=self._auth_headers(),
-            timeout=self.config.timeout_s,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_inventory_for_product_warehouse(
+        
+        logger.info(f"Fetching token from {token_url}")
+        
+        try:
+            response = self.session.post(
+                token_url,
+                json=payload,
+                timeout=self.timeout,
+                verify=True,  # Always verify SSL certificates
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.error(f"Token request failed: {e}")
+            raise
+        
+        try:
+            data = response.json()
+            token = data.get("access_token")
+            if not token:
+                raise ValueError(f"No access_token in response: {data}")
+            logger.info("Token obtained successfully")
+            return token
+        except (ValueError, KeyError) as e:
+            logger.error(f"Failed to parse token response: {e}")
+            raise
+    
+    def _ensure_token(self) -> str:
+        """
+        Ensure valid access token. Fetch new one if needed.
+        
+        Returns:
+            Valid access token
+        """
+        if not self.access_token:
+            self.access_token = self._fetch_token()
+        return self.access_token
+    
+    def get(
         self,
-        *,
-        product_id: str,
-        warehouse_id: int,
-    ) -> Dict[str, Any]:
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> requests.Response:
         """
-        Matches your working Postman call:
-        GET /api/Inventory/{productId}/Warehouses/{warehouseId}
-
-        Example:
-        /api/Inventory/WM-K42/Warehouses/142  -> { AvailableQty: 1189, ... }
+        Make an authenticated GET request to SellerCloud API.
+        
+        Args:
+            endpoint: API endpoint (e.g., "Inventory/GetAllByView")
+            params: Query parameters
+            **kwargs: Additional kwargs passed to session.get()
+            
+        Returns:
+            Response object
+            
+        Raises:
+            requests.RequestException: If request fails
         """
-        product_id = str(product_id).strip()
-        url = f"{self.base_url}/api/Inventory/{product_id}/Warehouses/{warehouse_id}"
-
-        resp = self._session.get(
-            url,
-            headers=self._auth_headers(),
-            timeout=self.config.timeout_s,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        token = self._ensure_token()
+        url = f"{self.base_url}/{endpoint}"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        logger.debug(f"GET {url} with params {params}")
+        
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=self.timeout,
+                verify=True,
+                **kwargs
+            )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            logger.error(f"GET request failed: {e}")
+            raise
+    
+    def post(
+        self,
+        endpoint: str,
+        json_data: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> requests.Response:
+        """
+        Make an authenticated POST request to SellerCloud API.
+        
+        Args:
+            endpoint: API endpoint
+            json_data: JSON payload
+            **kwargs: Additional kwargs passed to session.post()
+            
+        Returns:
+            Response object
+            
+        Raises:
+            requests.RequestException: If request fails
+        """
+        token = self._ensure_token()
+        url = f"{self.base_url}/{endpoint}"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        logger.debug(f"POST {url} with data {json_data}")
+        
+        try:
+            response = self.session.post(
+                url,
+                json=json_data,
+                headers=headers,
+                timeout=self.timeout,
+                verify=True,
+                **kwargs
+            )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            logger.error(f"POST request failed: {e}")
+            raise
